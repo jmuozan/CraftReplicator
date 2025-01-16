@@ -33,6 +33,6 @@ MACOSX_DEPLOYMENT_TARGET=10.14 CC=clang CXX=clang++ pip install "git+https://git
 5. To run demos or the code later, you'll need these additional packages:
 
 ```bash
-conda install jupyter
+conda install jupyter nb_conda
 pip install scikit-image matplotlib imageio plotly opencv-python
 ```
