@@ -7,4 +7,4 @@
 - 
 
 
-
+- [ ]: Get white background for images
