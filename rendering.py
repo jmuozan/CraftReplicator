@@ -5,7 +5,7 @@ def compute_accumulated_transmittance(betas):
     return torch.cat((torch.ones(accumulated_transmittance.shape[0], 1, device=accumulated_transmittance.device),
                       accumulated_transmittance[:, :-1]), dim=1)
 
-def rendering(model, rays_o, rays_d, tn, tf, nb_bins=100, device='mps', white_bckgr=True):
+def rendering(model, rays_o, rays_d, tn, tf, nb_bins=100, device='cpu', white_bckgr=True):
     
     t = torch.linspace(tn, tf, nb_bins).to(device) # [nb_bins]
     delta = torch.cat((t[1:] - t[:-1], torch.tensor([1e10], device=device)))
