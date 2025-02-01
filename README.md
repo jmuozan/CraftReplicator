@@ -1,4 +1,26 @@
-# What do I need?
+# CraftReplicator
+
+## Next steps:
+
+	- [ ]: Refine Meshes
+	- [ ]: Get color for mesh
+	- [ ]: Colmap camera info
+	- [ ]: Data detection / masking
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--
+#What do I need?
 
 
 
@@ -8,3 +30,4 @@
 
 
 - [ ]: Get white background for images
+-->
