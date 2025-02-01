@@ -2,6 +2,7 @@
 
 ## Next steps:
 
+
 	- [ ]: Refine Meshes
 	- [ ]: Get color for mesh
 	- [ ]: Colmap camera info
@@ -9,7 +10,34 @@
 
 
 
+fox/
+  ├── imgs/
+  │   ├── test_0.png
+  │   ├── test_1.png
+  │   ├── ...
+  │   ├── train_0.png
+  │   ├── train_1.png
+  │   └── ...
+  ├── test/ 
+  │   ├── intrinsics/
+  │   │   ├── test_0.txt
+  │   │   ├── test_1.txt
+  │   │   └── ...
+  │   ├── pose/
+  │   │   ├── test_0.txt
+  │   │   ├── test_1.txt
+  │   │   └── ...
+  ├── train/ 
+  │   ├── intrinsics/
+  │   │   ├── test_0.txt
+  │   │   ├── test_1.txt
+  │   │   └── ...
+  │   ├── pose/
+  │   │   ├── test_0.txt
+  │   │   ├── test_1.txt
+  │   │   └── ...
 
+   
 
 
 
