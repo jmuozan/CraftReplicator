@@ -3,6 +3,11 @@
 ## Next steps:
 
 
+
+```bash
+colmap gui
+```
+
 	- [ ]: Refine Meshes
 	- [ ]: Get color for mesh
 	- [ ]: Colmap camera info
