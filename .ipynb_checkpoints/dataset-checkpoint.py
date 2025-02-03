@@ -2,172 +2,230 @@ import numpy as np
 import os
 import imageio
 import configparser
+import sqlite3
+import struct
 from pathlib import Path
-import torch
 
-def parse_colmap_ini(ini_path):
-    """Parse COLMAP .ini configuration file"""
-    config = configparser.ConfigParser()
-    config.read(ini_path)
-    
-    # Extract camera parameters
-    camera_params = {}
-    for section in config.sections():
-        if section.startswith('camera'):
-            params = dict(config[section])
-            camera_params[section] = {
-                'model': params.get('model', ''),
-                'width': int(params.get('width', 0)),
-                'height': int(params.get('height', 0)),
-                'params': [float(x) for x in params.get('params', '').split()]
-            }
+def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
+    """Read and unpack the next bytes from a binary file."""
+    data = fid.read(num_bytes)
+    return struct.unpack(endian_character + format_char_sequence, data)
+
+def read_cameras_binary(path_to_model_file):
+    """
+    Read COLMAP camera binary file.
+    """
+    cameras = {}
+    with open(path_to_model_file, "rb") as fid:
+        num_cameras = read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_cameras):
+            camera_properties = read_next_bytes(
+                fid, num_bytes=24, format_char_sequence="iiQQ")
+            camera_id = camera_properties[0]
+            model_id = camera_properties[1]
+            width = camera_properties[2]
+            height = camera_properties[3]
             
-    # Extract image parameters
-    image_params = {}
-    for section in config.sections():
-        if section.startswith('image'):
-            params = dict(config[section])
-            image_params[section] = {
-                'camera_id': params.get('camera_id', ''),
-                'qw': float(params.get('qw', 0)),
-                'qx': float(params.get('qx', 0)), 
-                'qy': float(params.get('qy', 0)),
-                'qz': float(params.get('qz', 0)),
-                'tx': float(params.get('tx', 0)),
-                'ty': float(params.get('ty', 0)), 
-                'tz': float(params.get('tz', 0)),
-                'name': params.get('name', '')
-            }
+            num_params = read_next_bytes(fid, num_bytes=8, format_char_sequence="Q")[0]
+            params = read_next_bytes(fid, num_bytes=8*num_params,
+                                   format_char_sequence="d" * num_params)
             
-    return camera_params, image_params
+            cameras[camera_id] = {
+                "model_id": model_id,
+                "width": width,
+                "height": height,
+                "params": params
+            }
+        return cameras
 
-def quaternion_to_rotation_matrix(qw, qx, qy, qz):
-    """Convert quaternion to rotation matrix"""
-    R = np.zeros((3, 3))
-    
-    R[0,0] = 1 - 2*qy**2 - 2*qz**2
-    R[0,1] = 2*qx*qy - 2*qz*qw
-    R[0,2] = 2*qx*qz + 2*qy*qw
-    
-    R[1,0] = 2*qx*qy + 2*qz*qw
-    R[1,1] = 1 - 2*qx**2 - 2*qz**2
-    R[1,2] = 2*qy*qz - 2*qx*qw
-    
-    R[2,0] = 2*qx*qz - 2*qy*qw
-    R[2,1] = 2*qy*qz + 2*qx*qw
-    R[2,2] = 1 - 2*qx**2 - 2*qy**2
-    
-    return R
+def read_images_binary(path_to_model_file):
+    """
+    Read COLMAP images binary file.
+    """
+    images = {}
+    with open(path_to_model_file, "rb") as fid:
+        num_reg_images = read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_reg_images):
+            binary_image_properties = read_next_bytes(
+                fid, num_bytes=64, format_char_sequence="idddddddi")
+            
+            image_id = binary_image_properties[0]
+            qvec = np.array(binary_image_properties[1:5])
+            tvec = np.array(binary_image_properties[5:8])
+            camera_id = binary_image_properties[8]
 
-def get_rays_from_colmap(ini_path, images_dir, mode='train', train_val_split=0.8):
-    """Generate camera rays from COLMAP data
+            image_name = ""
+            current_char = read_next_bytes(fid, 1, "c")[0]
+            while current_char != b"\x00":
+                image_name += current_char.decode("utf-8")
+                current_char = read_next_bytes(fid, 1, "c")[0]
+            
+            num_points2D = read_next_bytes(fid, num_bytes=8,
+                                         format_char_sequence="Q")[0]
+            
+            x_y_id_s = read_next_bytes(fid, num_bytes=24*num_points2D,
+                                     format_char_sequence="ddq"*num_points2D)
+            
+            xys = np.column_stack([tuple(map(float, x_y_id_s[0::3])),
+                                 tuple(map(float, x_y_id_s[1::3]))])
+            point3D_ids = np.array(tuple(map(int, x_y_id_s[2::3])))
+            
+            images[image_id] = {
+                "qvec": qvec,
+                "tvec": tvec,
+                "camera_id": camera_id,
+                "name": image_name,
+                "xys": xys,
+                "point3D_ids": point3D_ids
+            }
+    return images
+
+def qvec2rotmat(qvec):
+    """Convert quaternion to rotation matrix."""
+    return np.array([
+        [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2,
+         2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+         2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2]],
+        [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+         1 - 2 * qvec[1]**2 - 2 * qvec[3]**2,
+         2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1]],
+        [2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+         2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+         1 - 2 * qvec[1]**2 - 2 * qvec[2]**2]])
+
+def get_rays_from_colmap(base_dir, mode='train', split_ratio=0.9):
+    """
+    Get camera rays from COLMAP sparse reconstruction.
     
     Args:
-        ini_path: Path to COLMAP .ini file
-        images_dir: Directory containing input images
-        mode: Either 'train' or 'test' 
-        train_val_split: Fraction of images to use for training
+        base_dir: Base directory containing COLMAP sparse reconstruction
+        mode: Either 'train' or 'test'
+        split_ratio: Ratio of images to use for training (default: 0.9)
     
     Returns:
-        rays_o: Ray origins
-        rays_d: Ray directions  
-        target_px_values: RGB values
+        rays_o: Ray origins (N, H*W, 3)
+        rays_d: Ray directions (N, H*W, 3)
+        target_px_values: RGB values (N, H*W, 3)
     """
+    sparse_dir = os.path.join(base_dir, 'sparse', '0')
     
-    camera_params, image_params = parse_colmap_ini(ini_path)
+    # Read COLMAP data
+    cameras = read_cameras_binary(os.path.join(sparse_dir, 'cameras.bin'))
+    images = read_images_binary(os.path.join(sparse_dir, 'images.bin'))
     
-    # Sort images to ensure consistent train/test split
-    image_names = sorted([p['name'] for p in image_params.values()])
-    split_idx = int(len(image_names) * train_val_split)
+    # Sort images by name to ensure consistent order
+    image_list = sorted(images.items(), key=lambda x: x[1]['name'])
     
+    # Split into train/test
+    split_idx = int(len(image_list) * split_ratio)
     if mode == 'train':
-        image_names = image_names[:split_idx]
+        image_list = image_list[:split_idx]
     else:
-        image_names = image_names[split_idx:]
+        image_list = image_list[split_idx:]
+    
+    rays_o = []
+    rays_d = []
+    target_px_values = []
+    
+    for image_id, image_data in image_list:
+        # Get camera parameters
+        camera = cameras[image_data['camera_id']]
+        H, W = camera['height'], camera['width']
+        f = camera['params'][0]  # Assuming SIMPLE_PINHOLE camera model
         
-    N = len(image_names)
-    
-    # Use parameters from first camera (assuming single camera)
-    cam = list(camera_params.values())[0]
-    H, W = cam['height'], cam['width']
-    focal = cam['params'][0]  # Assuming SIMPLE_PINHOLE camera model
-    
-    images = []
-    poses = []
-    
-    for img_name in image_names:
-        # Find corresponding image parameters
-        img_param = None
-        for p in image_params.values():
-            if p['name'] == img_name:
-                img_param = p
-                break
-                
-        if img_param is None:
-            raise ValueError(f"Could not find parameters for image {img_name}")
-            
         # Load image
-        img_path = os.path.join(images_dir, img_name)
-        img = imageio.imread(img_path) / 255.
-        if img.shape[-1] == 4:  # RGBA -> RGB
-            img = img[..., :3] * img[..., -1:] + (1 - img[..., -1:])
-        images.append(img[None, ...])
+        img_path = os.path.join(base_dir, 'images', image_data['name'])
+        img = imageio.imread(img_path).astype(np.float32) / 255.0
         
-        # Build camera pose
-        R = quaternion_to_rotation_matrix(
-            img_param['qw'], img_param['qx'], 
-            img_param['qy'], img_param['qz']
-        )
-        t = np.array([img_param['tx'], img_param['ty'], img_param['tz']])
+        # Convert quaternion to rotation matrix
+        R = qvec2rotmat(image_data['qvec'])
+        t = image_data['tvec']
         
-        pose = np.eye(4)
-        pose[:3, :3] = R
-        pose[:3, 3] = t
-        poses.append(pose)
+        # Camera center (ray origin)
+        C = -R.T @ t
         
-    images = np.concatenate(images)
-    poses = np.stack(poses)
-    
-    rays_o = np.zeros((N, H*W, 3))
-    rays_d = np.zeros((N, H*W, 3))
-    target_px_values = images.reshape((N, H*W, 3))
-    
-    for i in range(N):
-        c2w = poses[i]
-        
-        # Generate ray directions
+        # Generate rays
         u = np.arange(W)
         v = np.arange(H)
         u, v = np.meshgrid(u, v)
-        dirs = np.stack((u - W/2, -(v - H/2), -np.ones_like(u) * focal), axis=-1)
         
-        # Transform directions to world space
-        dirs = (c2w[:3, :3] @ dirs[..., None]).squeeze(-1)
+        # Pixel coordinates to camera coordinates
+        x = (u - W/2)
+        y = -(v - H/2)
+        z = -np.ones_like(u) * f
+        
+        # Convert to world coordinates
+        dirs = np.stack([x, y, z], axis=-1)
+        dirs = (R.T @ dirs.reshape(-1, 3).T).T
         dirs = dirs / np.linalg.norm(dirs, axis=-1, keepdims=True)
         
-        rays_d[i] = dirs.reshape(-1, 3)
-        rays_o[i] += c2w[:3, 3]
-        
+        rays_o.append(np.broadcast_to(C, dirs.shape))
+        rays_d.append(dirs)
+        target_px_values.append(img.reshape(-1, 3))
+    
+    rays_o = np.stack(rays_o)
+    rays_d = np.stack(rays_d)
+    target_px_values = np.stack(target_px_values)
+    
     return rays_o, rays_d, target_px_values
 
-# Example usage:
-if __name__ == "__main__":
-    ini_path = "fox/fox.ini"
-    images_dir = "fox/imgs"
-    
-    # Get training rays
-    rays_o, rays_d, target_px_values = get_rays_from_colmap(
-        ini_path, images_dir, mode='train'
-    )
-    
-    # Create data loader
-    data = torch.cat((
-        torch.from_numpy(rays_o).reshape(-1, 3).type(torch.float),
-        torch.from_numpy(rays_d).reshape(-1, 3).type(torch.float),
-        torch.from_numpy(target_px_values).reshape(-1, 3).type(torch.float)
-    ), dim=1)
-    
-    batch_size = 1024
-    data_loader = torch.utils.data.DataLoader(
-        data, batch_size=batch_size, shuffle=True
-    )
+def get_rays(datapath, mode='train'):
+    """
+    Wrapper function that supports both old text-based and new COLMAP-based loading.
+    """
+    # Check if COLMAP data exists
+    if os.path.exists(os.path.join(datapath, 'sparse')):
+        return get_rays_from_colmap(datapath, mode)
+    else:
+        # Original text-based loading code
+        pose_file_names = [f for f in os.listdir(datapath + f'/{mode}/pose') if f.endswith('.txt')]
+        intrisics_file_names = [f for f in os.listdir(datapath + f'/{mode}/intrinsics') if f.endswith('.txt')]
+        img_file_names = [f for f in os.listdir(datapath + '/imgs') if mode in f]
+        
+        assert len(pose_file_names) == len(intrisics_file_names)
+        assert len(img_file_names) == len(pose_file_names)
+        
+        N = len(pose_file_names)
+        poses = np.zeros((N, 4, 4))
+        intrinsics = np.zeros((N, 4, 4))
+        images = []
+        
+        for i in range(N):
+            name = pose_file_names[i]
+            
+            pose = open(datapath + f'/{mode}/pose/' + name).read().split()
+            poses[i] = np.array(pose, dtype=float).reshape(4, 4)
+            
+            intrinsic = open(datapath + f'/{mode}/intrinsics/' + name).read().split()
+            intrinsics[i] = np.array(intrinsic, dtype=float).reshape(4, 4)
+            
+            img = imageio.imread(datapath + '/imgs/' + name.replace('txt', 'png')) / 255.
+            images.append(img[None, ...])
+            
+        images = np.concatenate(images)
+        
+        H = images.shape[1]
+        W = images.shape[2]
+        
+        if images.shape[3] == 4:
+            images = images[..., :3] * images[..., -1:] + (1 - images[..., -1:])
+        
+        rays_o = np.zeros((N, H*W, 3))
+        rays_d = np.zeros((N, H*W, 3))
+        target_px_values = images.reshape((N, H*W, 3))
+        
+        for i in range(N):
+            c2w = poses[i]
+            f = intrinsics[i, 0, 0]
+            
+            u = np.arange(W)
+            v = np.arange(H)
+            u, v = np.meshgrid(u, v)
+            dirs = np.stack((u - W/2, -(v - H/2), -np.ones_like(u) * f), axis=-1)
+            dirs = (c2w[:3, :3] @ dirs[..., None]).squeeze(-1)
+            dirs = dirs / np.linalg.norm(dirs, axis=-1, keepdims=True)
+            
+            rays_d[i] = dirs.reshape(-1, 3)
+            rays_o[i] += c2w[:3, 3]
+        
+        return rays_o, rays_d, target_px_values
