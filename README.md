@@ -2,19 +2,20 @@
 
 ## Next steps:
 
-
+```bash
+brew install colmap
+```
 
 ```bash
 colmap gui
 ```
 
-	- [ ]: Refine Meshes
-	- [ ]: Get color for mesh
-	- [ ]: Colmap camera info
+  - [ ]: Colmap camera info
 	- [ ]: Data detection / masking
 
 
 
+<!--
 fox/
   ├── imgs/
   │   ├── test_0.png
@@ -42,7 +43,6 @@ fox/
   │   │   ├── test_1.txt
   │   │   └── ...
 
-   
 
 
 
@@ -51,8 +51,6 @@ fox/
 
 
 
-
-<!--
 #What do I need?
 
 
