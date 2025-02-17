@@ -10,8 +10,17 @@ brew install colmap
 colmap gui
 ```
 
-  - [ ]: Colmap camera info
-	- [ ]: Data detection / masking
+
+
+
+
+- [ ] Nerf in the wild generation
+- [ ] Masking and resizing
+- [ ] Meshformer / Meshanything
+
+Could light be "redone" to fit various images??
+
+
 
 
 
