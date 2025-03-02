@@ -1,5 +1,6 @@
-data
-models/mesh_tests.obj
-NeRFs/models
-NeRFs/fox
-STEP_1_SAM/sam_vit_h_4b8939.pth
+STEP_1_SAM/ceramics_frames
+STEP_1_SAM/porcelain_frames
+STEP_1_SAM/sam2.1_hiera_large.pt
+STEP_2_NeRF/db
+STEP_1_SAM/ceramics.mp4
+STEP_1_SAM/porcelain.mp4
