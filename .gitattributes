@@ -1,0 +1,4 @@
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.db filter=lfs diff=lfs merge=lfs -text
+STEP_2_NeRF/nerf_dataset/colmap_output/sparse/**/*.bin filter=lfs diff=lfs merge=lfs -text
