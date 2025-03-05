@@ -6,6 +6,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from PIL import Image
 
+import torch
+import numpy as np
+from tqdm import tqdm
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from PIL import Image
+import os
+import argparse
+from nerf_dataset import NeRFDataset  # Import our new dataset class
+
+# The model classes remain the same as your original script
 class CombinedNGPNeRFW(torch.nn.Module):
     """
     Combined model that uses Instant NGP's hash encoding for efficiency
@@ -215,6 +226,7 @@ class CombinedNGPNeRFW(torch.nn.Module):
         
         return static_rgb, torch.exp(static_sigma), transient_rgb, torch.exp(transient_sigma), transient_beta
 
+# Functions for rendering rays remain the same
 def compute_accumulated_transmittance(alphas):
     """Compute accumulated transmittance along rays"""
     accumulated_transmittance = torch.cumprod(alphas, 1)
@@ -348,6 +360,8 @@ def train_combined(model, optimizer, data_loader, device='mps', hn=0, hf=1, nb_e
     for epoch in range(nb_epochs):
         epoch_loss = 0
         for batch in tqdm(data_loader):
+            # Extract data from batch
+            # Format: [ray_origin(3), ray_direction(3), appearance_idx(1), transient_idx(1), rgb(3)]
             ray_origins = batch[:, :3].to(device).float()
             ray_directions = batch[:, 3:6].to(device).float()
             appearance_idx = batch[:, 6].long().to(device) if batch.shape[1] > 8 else None
@@ -383,14 +397,14 @@ def train_combined(model, optimizer, data_loader, device='mps', hn=0, hf=1, nb_e
         print(f"Epoch {epoch+1}/{nb_epochs}, Loss: {epoch_loss/len(data_loader):.6f}")
 
 @torch.no_grad()
-def test_combined(model, dataset, img_index, appearance_idx=None, transient_idx=None,
-                 chunk_size=20, nb_bins=192, H=400, W=400, hn=0, hf=0.5):
+def test_combined(model, test_dataset, img_index, appearance_idx=None, transient_idx=None,
+                 chunk_size=20, nb_bins=192, H=400, W=400, hn=0, hf=0.5, output_dir='novel_views'):
     """
     Test function for the combined model
     
     Args:
         model: The neural network model
-        dataset: Dataset containing test data
+        test_dataset: Dataset containing test data
         img_index: Index of the image to test
         appearance_idx: Index for appearance embedding
         transient_idx: Index for transient embedding
@@ -398,17 +412,36 @@ def test_combined(model, dataset, img_index, appearance_idx=None, transient_idx=
         nb_bins: Number of sample bins per ray
         H, W: Image height and width
         hn, hf: Near and far plane distances
+        output_dir: Directory to save output images
     """
     device = next(model.parameters()).device
+    os.makedirs(output_dir, exist_ok=True)
     
-    ray_origins = dataset[img_index * H * W: (img_index + 1) * H * W, :3]
-    ray_directions = dataset[img_index * H * W: (img_index + 1) * H * W, 3:6]
+    # Get rays for the entire image
+    start_idx = img_index * H * W
+    end_idx = (img_index + 1) * H * W
+    
+    # Check if the dataset is large enough
+    if start_idx >= len(test_dataset) or end_idx > len(test_dataset):
+        print(f"Warning: Image index {img_index} is out of bounds for dataset of size {len(test_dataset)}")
+        # Use available rays instead
+        start_idx = 0
+        end_idx = min(H * W, len(test_dataset))
+    
+    ray_data = test_dataset[start_idx:end_idx]
+    ray_origins = ray_data[:, :3].to(device)
+    ray_directions = ray_data[:, 3:6].to(device)
     
     # Use fixed appearance and transient indices if provided
     if appearance_idx is not None:
         appearance_idx = torch.ones_like(ray_origins[:, 0], dtype=torch.long) * appearance_idx
+    else:
+        appearance_idx = ray_data[:, 6].long().to(device) if ray_data.shape[1] > 8 else None
+        
     if transient_idx is not None:
         transient_idx = torch.ones_like(ray_origins[:, 0], dtype=torch.long) * transient_idx
+    else:
+        transient_idx = ray_data[:, 7].long().to(device) if ray_data.shape[1] > 8 else None
     
     # Render chunks of rays
     combined_rgb = []
@@ -417,17 +450,17 @@ def test_combined(model, dataset, img_index, appearance_idx=None, transient_idx=
     depth = []
     beta = []
     
-    for i in range(int(np.ceil(H * W / (W * chunk_size)))):
-        start_idx = i * W * chunk_size
-        end_idx = min((i + 1) * W * chunk_size, H * W)
+    for i in range(int(np.ceil(ray_origins.shape[0] / chunk_size))):
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, ray_origins.shape[0])
         
         # Get chunk data
-        rays_o = ray_origins[start_idx:end_idx].to(device)
-        rays_d = ray_directions[start_idx:end_idx].to(device)
+        rays_o = ray_origins[start:end]
+        rays_d = ray_directions[start:end]
         
         # Get appearance and transient indices for this chunk if available
-        a_idx = appearance_idx[start_idx:end_idx].to(device) if appearance_idx is not None else None
-        t_idx = transient_idx[start_idx:end_idx].to(device) if transient_idx is not None else None
+        a_idx = appearance_idx[start:end] if appearance_idx is not None else None
+        t_idx = transient_idx[start:end] if transient_idx is not None else None
         
         # Render rays
         results = render_rays_combined(model, rays_o, rays_d, a_idx, t_idx, hn=hn, hf=hf, nb_bins=nb_bins)
@@ -449,25 +482,25 @@ def test_combined(model, dataset, img_index, appearance_idx=None, transient_idx=
     # Save images
     # Combined RGB
     combined_img = (combined_rgb.clip(0, 1) * 255).astype(np.uint8)
-    Image.fromarray(combined_img).save(f'novel_views/combined_img_{img_index}.png')
+    Image.fromarray(combined_img).save(f'{output_dir}/combined_img_{img_index}.png')
     
     # Static RGB
     static_img = (static_rgb.clip(0, 1) * 255).astype(np.uint8)
-    Image.fromarray(static_img).save(f'novel_views/static_img_{img_index}.png')
+    Image.fromarray(static_img).save(f'{output_dir}/static_img_{img_index}.png')
     
     # Transient RGB (may be very dark if no transient elements)
     transient_img = (transient_rgb.clip(0, 1) * 255).astype(np.uint8)
-    Image.fromarray(transient_img).save(f'novel_views/transient_img_{img_index}.png')
+    Image.fromarray(transient_img).save(f'{output_dir}/transient_img_{img_index}.png')
     
     # Depth visualization
     depth_normalized = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-8)
     depth_img = (depth_normalized * 255).astype(np.uint8)
-    Image.fromarray(depth_img).save(f'novel_views/depth_img_{img_index}.png')
+    Image.fromarray(depth_img).save(f'{output_dir}/depth_img_{img_index}.png')
     
     # Beta/uncertainty visualization
     beta_normalized = (beta_map - beta_map.min()) / (beta_map.max() - beta_map.min() + 1e-8)
     beta_img = (beta_normalized * 255).astype(np.uint8)
-    Image.fromarray(beta_img).save(f'novel_views/uncertainty_img_{img_index}.png')
+    Image.fromarray(beta_img).save(f'{output_dir}/uncertainty_img_{img_index}.png')
     
     return combined_img, static_img, transient_img, depth_img, beta_img
 
