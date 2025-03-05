@@ -11,6 +11,15 @@ data/
 ```bash
 mkdir -p data/porcelain/sparse
 
+# Extract features
+colmap feature_extractor \
+    --database_path data/porcelain/database.db \
+    --image_path data/porcelain
+
+# Match features
+colmap exhaustive_matcher \
+    --database_path data/porcelain/database.db
+
 colmap mapper \
     --database_path data/porcelain/database.db \
     --image_path data/porcelain \
@@ -30,7 +39,7 @@ ls -la data/porcelain_nerf/images/ | wc -l
 
 ```bash
 python train.py \
-  --dataset_name blender \
+  --dataset_name porcelain_nerf \
   --root_dir data/porcelain_nerf \
   --N_importance 64 \
   --img_wh 1080 1080 \
@@ -46,3 +55,18 @@ python train.py \
   --encode_a \
   --beta_min 0.1
 ```
+
+
+
+
+
+
+python instant-ngp-nerfw.py \
+    --data_dir data/porcelain_nerf \
+    --output_dir novel_views_porcelain \
+    --img_wh 800 800 \
+    --epochs 20 \
+    --batch_size 1024 \
+    --near 2.0 \
+    --far 6.0 \
+    --lambda_u 0.01
