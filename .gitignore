@@ -1,9 +1,12 @@
-STEP_1_SAM/ceramics_frames
-STEP_1_SAM/porcelain_frames
-STEP_1_SAM/sam2.1_hiera_large.pt
-STEP_2_NeRF/db
-STEP_1_SAM/ceramics.mp4
-STEP_1_SAM/porcelain.mp4
-fox
+2_NeRFs/DATA
+2_NeRFs/VERSIONS
+1_Segment_Anything/VIDEOS
+1_Segment_Anything/extracted
+1_Segment_Anything/porcelain
+1_Segment_Anything/sam2
+1_Segment_Anything/sam2.1_hiera_large.pt
 
-STEP_2_NeRF/data/lego
+
+
+STEP_2_NeRF/data
+STEP_3_VIZ/nerf_model_weights.pth
