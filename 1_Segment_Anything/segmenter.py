@@ -13,14 +13,15 @@ import sam2
 import gc
 import traceback
 import time  # For timing operations
+import json  # For saving/loading scene data
+from types import MethodType
 
 # Device selection
 if torch.cuda.is_available():
     device = torch.device("cuda")
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
-    # Set MPS memory optimization for Apple Silicon
-    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.8"
+    # We'll handle MPS memory settings later based on user input
 else:
     device = torch.device("cpu")
 print(f"Using device: {device}")
@@ -182,13 +183,172 @@ def show_box(box, ax):
     w, h = box[2] - box[0], box[3] - box[1]
     ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0, 0, 0, 0), lw=2))
 
+# Define the to() method for SAM2VideoPredictor instances
+# Modified _predictor_to function that works with read-only device properties
+def _predictor_to(self, target_device):
+    """Move the model to the target device without modifying the device property"""
+    original_device = self.device
+    
+    try:
+        print(f"Moving model from {original_device} to {target_device}...")
+        # Instead of changing the device property, we directly move the model
+        self.model = self.model.to(target_device)
+        print(f"Model successfully moved to {target_device}")
+        return True
+    except Exception as e:
+        print(f"Error moving model to {target_device}: {e}")
+        return False
+
+# Modified _propagate_chunk function that handles device switching differently
+def _propagate_chunk(self, start_idx, end_idx):
+    """Propagate within a chunk using keyframes with automatic fallback to CPU on memory errors"""
+    # Calculate keyframes within this chunk
+    if start_idx >= end_idx - 1:
+        return  # Nothing to propagate
+        
+    # Create keyframes at regular intervals
+    keyframes = list(range(start_idx, end_idx, self.keyframe_interval))
+    if keyframes[-1] != end_idx - 1:
+        keyframes.append(end_idx - 1)
+        
+    print(f"Propagating with {len(keyframes)} keyframes in chunk")
+    
+    for i in range(len(keyframes) - 1):
+        kf_start = keyframes[i]
+        kf_end = keyframes[i + 1] + 1  # +1 because ranges are exclusive at the end
+        
+        print(f"Processing keyframe segment {kf_start} to {kf_end-1}")
+        
+        # Try with current device first (MPS/CUDA)
+        try:
+            # For each keyframe, do multiple propagation passes
+            for pass_idx in range(self.propagation_steps):
+                with torch.no_grad():
+                    for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(self.inference_state):
+                        if kf_start <= out_frame_idx < kf_end:
+                            # Save masks for this frame
+                            current_frame_data = {
+                                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                                for i, out_obj_id in enumerate(out_obj_ids)
+                            }
+                            self.save_single_frame_results(out_frame_idx, current_frame_data)
+                            
+                            if out_frame_idx % 10 == 0:
+                                print(f"Processed frame {out_frame_idx} (pass {pass_idx+1}/{self.propagation_steps})")
+                        
+                        # Stop after kf_end frames
+                        if out_frame_idx >= kf_end - 1:
+                            break
+        
+        except RuntimeError as e:
+            # Check if it's a memory error
+            if "out of memory" in str(e) and self.enable_auto_fallback:
+                print(f"\nMemory error detected: {e}")
+                print("Creating a new predictor instance on CPU for this segment...")
+                
+                try:
+                    # Instead of modifying the existing predictor, create a new one on CPU
+                    cpu_predictor = build_sam2_video_predictor_hf(
+                        self.model_id,
+                        device="cpu"
+                    )
+                    
+                    # Add the to() method to the new CPU predictor instance
+                    from types import MethodType
+                    cpu_predictor.to = MethodType(_predictor_to, cpu_predictor)
+                    
+                    # Initialize new state and reset it
+                    print("Initializing new CPU predictor state...")
+                    cpu_state = cpu_predictor.init_state(video_path=self.video_dir)
+                    
+                    # Find the latest processed frame data
+                    latest_frame = max([f for f in range(start_idx, kf_start + 1) if f in self.video_segments], default=None)
+                    if latest_frame is not None and self.current_obj_id in self.video_segments[latest_frame]:
+                        # If we have a previous mask, use it to guide the CPU predictor
+                        print(f"Using mask from frame {latest_frame} to guide CPU processing")
+                        mask = self.video_segments[latest_frame][self.current_obj_id]
+                        # Convert numpy mask to torch tensor
+                        mask_tensor = torch.from_numpy(mask).float().unsqueeze(0).unsqueeze(0)
+                        
+                        # Use the mask as initial state for the CPU predictor
+                        # Note: This initialization depends on your SAM2 implementation
+                        # You might need to adjust this part to match your implementation
+                        with torch.no_grad():
+                            try:
+                                # Try to initialize with mask if your implementation supports it
+                                cpu_predictor.add_mask(
+                                    inference_state=cpu_state,
+                                    frame_idx=kf_start,
+                                    obj_id=self.current_obj_id,
+                                    masks=mask_tensor
+                                )
+                            except Exception as mask_err:
+                                print(f"Could not initialize with mask: {mask_err}")
+                                # Fallback to using points if mask doesn't work
+                                scene_id = self.get_scene_for_frame(kf_start)
+                                if scene_id is not None and scene_id in self.scene_annotations:
+                                    for frame_str, (points, labels) in self.scene_annotations[scene_id].items():
+                                        frame_idx = int(frame_str)
+                                        if frame_idx <= kf_start:
+                                            closest_frame = frame_idx
+                                            closest_points = points
+                                            closest_labels = labels
+                                    
+                                    if closest_points and closest_labels:
+                                        print(f"Using points from frame {closest_frame} to guide CPU processing")
+                                        points_array = np.array(closest_points, dtype=np.float32)
+                                        labels_array = np.array(closest_labels, dtype=np.int32)
+                                        
+                                        cpu_predictor.add_new_points_or_box(
+                                            inference_state=cpu_state,
+                                            frame_idx=kf_start,
+                                            obj_id=self.current_obj_id,
+                                            points=points_array,
+                                            labels=labels_array,
+                                        )
+                    
+                    # Process on CPU with new predictor
+                    for pass_idx in range(self.propagation_steps):
+                        with torch.no_grad():
+                            for out_frame_idx, out_obj_ids, out_mask_logits in cpu_predictor.propagate_in_video(cpu_state):
+                                if kf_start <= out_frame_idx < kf_end:
+                                    # Save masks for this frame
+                                    current_frame_data = {
+                                        out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                                        for i, out_obj_id in enumerate(out_obj_ids)
+                                    }
+                                    self.save_single_frame_results(out_frame_idx, current_frame_data)
+                                    
+                                    if out_frame_idx % 5 == 0:  # More frequent updates on CPU
+                                        print(f"Processed frame {out_frame_idx} on CPU (pass {pass_idx+1}/{self.propagation_steps})")
+                                
+                                # Stop after kf_end frames
+                                if out_frame_idx >= kf_end - 1:
+                                    break
+                    
+                    # Clean up CPU predictor to free memory
+                    del cpu_predictor
+                    del cpu_state
+                    gc.collect()
+                    
+                except Exception as cpu_error:
+                    print(f"Error processing on CPU as well: {cpu_error}")
+                    traceback.print_exc()
+                    raise
+            else:
+                # Not a memory error or fallback disabled
+                raise
+
+
+
 class InteractiveSegmenter:
     def __init__(self, video_dir, batch_size=1, preload_frames=False, model_id=None, 
-                 keyframe_interval=10, propagation_steps=3):
+                 keyframe_interval=10, propagation_steps=3, enable_auto_fallback=True):
         self.video_dir = video_dir
         self.output_dir = os.path.join(video_dir, "segmentation_output")
         self.mask_dir = os.path.join(self.output_dir, "masks")
         self.overlay_dir = os.path.join(self.output_dir, "overlays")
+        self.scenes_file = os.path.join(self.output_dir, "scenes.json")
         
         # Keyframe management for better tracking
         self.keyframe_interval = keyframe_interval  # Re-apply annotations every N frames
@@ -197,6 +357,7 @@ class InteractiveSegmenter:
         # Memory optimization options
         self.batch_size = batch_size
         self.preload_frames = preload_frames
+        self.enable_auto_fallback = enable_auto_fallback
         
         self.model_id = model_id if model_id else "facebook/sam2.1-hiera-large"
         
@@ -213,6 +374,37 @@ class InteractiveSegmenter:
         self.frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
         
         print(f"Found {len(self.frame_names)} frames in {video_dir}")
+        
+        # Scene management
+        self.scenes = []
+        self.current_scene = None
+        self.scene_annotations = {}  # Maps scene_id -> {frame_idx: (points, labels)}
+        
+        # Try to load existing scene data
+        if os.path.exists(self.scenes_file):
+            try:
+                with open(self.scenes_file, 'r') as f:
+                    scene_data = json.load(f)
+                    self.scenes = scene_data.get('scenes', [])
+                    
+                    # Convert string keys back to integers for scene_annotations
+                    self.scene_annotations = {}
+                    for scene_id_str, scene_annot in scene_data.get('annotations', {}).items():
+                        scene_id = int(scene_id_str)
+                        self.scene_annotations[scene_id] = {}
+                        for frame_idx_str, (points, labels) in scene_annot.items():
+                            self.scene_annotations[scene_id][frame_idx_str] = (points, labels)
+                    
+                    print(f"Loaded {len(self.scenes)} existing scenes")
+            except Exception as e:
+                print(f"Error loading scene data: {e}")
+                self.scenes = []
+                self.scene_annotations = {}
+        
+        # If we have scenes, set the current one
+        if self.scenes:
+            self.current_scene = 0  # Use the index of the first scene
+            print(f"Current scene: {self.current_scene}")
         
         # We'll only cache the current frame to save memory
         self.frame_cache = {}
@@ -236,6 +428,9 @@ class InteractiveSegmenter:
                 device=device
             )
             
+            # Add the to() method to the predictor instance
+            self.predictor.to = MethodType(_predictor_to, self.predictor)
+            
             # Initialize with the first frame only to save memory
             print("Initializing model state...")
             self.inference_state = self.predictor.init_state(video_path=video_dir)
@@ -251,6 +446,9 @@ class InteractiveSegmenter:
                     cpu_device = torch.device("cpu")
                     try:
                         self.predictor = build_sam2_video_predictor_hf(self.model_id, device=cpu_device)
+                        # Add the to() method to the predictor instance
+                        self.predictor.to = MethodType(_predictor_to, self.predictor)
+                        
                         print("Initializing model state on CPU...")
                         self.inference_state = self.predictor.init_state(video_path=video_dir)
                         self.predictor.reset_state(self.inference_state)
@@ -278,14 +476,12 @@ class InteractiveSegmenter:
         self.point_mode = 1  # 1 for positive, 0 for negative
         self.video_segments = {}  # To store segmentation results
         
-        # Store initial points and reference mask for re-application
-        self.initial_points = None
-        self.initial_labels = None
-        self.reference_mask = None
+        # Store points for the current frame
+        self.frame_points = {}  # Maps frame_idx -> (points, labels)
         
         # Figure setup
         self.fig, self.ax = plt.subplots(figsize=(12, 8))
-        plt.subplots_adjust(bottom=0.2)
+        plt.subplots_adjust(bottom=0.3)  # More space for buttons
         
         # Add interaction buttons
         self.add_mode_button = Button(plt.axes([0.1, 0.05, 0.15, 0.06]), 'Pos/Neg Mode')
@@ -304,6 +500,20 @@ class InteractiveSegmenter:
         self.clear_button = Button(plt.axes([0.1, 0.13, 0.15, 0.06]), 'Clear Points')
         self.clear_button.on_clicked(self.clear_points)
         
+        # Scene management buttons
+        self.new_scene_button = Button(plt.axes([0.3, 0.13, 0.15, 0.06]), 'New Scene')
+        self.new_scene_button.on_clicked(self.new_scene)
+        
+        self.prev_scene_button = Button(plt.axes([0.5, 0.13, 0.15, 0.06]), 'Prev Scene')
+        self.prev_scene_button.on_clicked(self.prev_scene)
+        
+        self.next_scene_button = Button(plt.axes([0.7, 0.13, 0.15, 0.06]), 'Next Scene')
+        self.next_scene_button.on_clicked(self.next_scene)
+        
+        # Process current scene button
+        self.process_scene_button = Button(plt.axes([0.3, 0.21, 0.4, 0.06]), 'Process Current Scene')
+        self.process_scene_button.on_clicked(self.process_current_scene)
+        
         # Connect mouse event
         self.fig.canvas.mpl_connect('button_press_event', self.on_click)
         
@@ -311,13 +521,149 @@ class InteractiveSegmenter:
         self.load_frame(self.current_frame_idx)
         plt.show()
     
+    def check_memory(self):
+        """Check available memory and return True if we should use CPU instead"""
+        if not self.enable_auto_fallback:
+            return False
+            
+        if self.predictor.device.type != "mps" and self.predictor.device.type != "cuda":
+            return False  # Already on CPU
+            
+        try:
+            import psutil
+            
+            if self.predictor.device.type == "mps":
+                # For MPS (Apple Silicon), check system memory
+                mem = psutil.virtual_memory()
+                available_gb = mem.available/1024/1024/1024
+                
+                # If less than 2GB available, use CPU
+                if available_gb < 2:
+                    print(f"Low system memory detected: {available_gb:.1f}GB available. Switching to CPU.")
+                    return True
+            
+            elif self.predictor.device.type == "cuda":
+                # For CUDA, check GPU memory
+                try:
+                    # Get free and total memory in GB
+                    free_gpu_mem = torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0)
+                    free_gpu_mem_gb = free_gpu_mem / 1024 / 1024 / 1024
+                    
+                    # If less than 1GB free, use CPU
+                    if free_gpu_mem_gb < 1:
+                        print(f"Low GPU memory detected: {free_gpu_mem_gb:.1f}GB free. Switching to CPU.")
+                        return True
+                except:
+                    # If can't check GPU memory, default to system memory check
+                    mem = psutil.virtual_memory()
+                    if mem.available < 2 * 1024 * 1024 * 1024:  # Less than 2GB
+                        return True
+        except:
+            # If we can't check memory, just continue with current device
+            pass
+            
+        return False
+    
+    def save_scene_data(self):
+        """Save scene boundaries and annotations to disk"""
+        # Convert scene_annotations to a serializable format
+        serializable_annotations = {}
+        for scene_id, scene_annot in self.scene_annotations.items():
+            serializable_annotations[str(scene_id)] = {}
+            for frame_idx, (points, labels) in scene_annot.items():
+                serializable_annotations[str(scene_id)][frame_idx] = (points, labels)
+        
+        scene_data = {
+            'scenes': self.scenes,
+            'annotations': serializable_annotations
+        }
+        
+        with open(self.scenes_file, 'w') as f:
+            json.dump(scene_data, f)
+        print(f"Saved scene data to {self.scenes_file}")
+    
+    def new_scene(self, event):
+        """Create a new scene starting at the current frame"""
+        if self.scenes and self.current_frame_idx <= self.scenes[-1]:
+            print(f"Cannot create a new scene at frame {self.current_frame_idx} because it overlaps with existing scene")
+            return
+            
+        scene_id = len(self.scenes)
+        self.scenes.append(self.current_frame_idx)
+        self.current_scene = scene_id
+        self.scene_annotations[scene_id] = {}
+        
+        print(f"Created new scene {scene_id} starting at frame {self.current_frame_idx}")
+        self.save_scene_data()
+        self.clear_points(None)
+        self.load_frame(self.current_frame_idx)
+    
+    def get_scene_for_frame(self, frame_idx):
+        """Find which scene contains the given frame"""
+        if not self.scenes:
+            return None
+            
+        for i in range(len(self.scenes)-1):
+            if self.scenes[i] <= frame_idx < self.scenes[i+1]:
+                return i
+                
+        # Check if it's in the last scene
+        if self.scenes[-1] <= frame_idx:
+            return len(self.scenes) - 1
+            
+        return None
+    
+    def get_scene_range(self, scene_id):
+        """Get the range of frames for a scene"""
+        if scene_id is None or scene_id >= len(self.scenes):
+            return (None, None)
+            
+        start = self.scenes[scene_id]
+        end = len(self.frame_names)
+        
+        if scene_id < len(self.scenes) - 1:
+            end = self.scenes[scene_id + 1]
+            
+        return (start, end)
+    
+    def prev_scene(self, event):
+        """Move to the previous scene"""
+        if not self.scenes:
+            print("No scenes defined yet")
+            return
+            
+        current_scene = self.get_scene_for_frame(self.current_frame_idx)
+        if current_scene is None or current_scene <= 0:
+            print("Already at the first scene")
+            return
+            
+        target_scene = current_scene - 1
+        self.current_scene = target_scene
+        self.current_frame_idx = self.scenes[target_scene]
+        print(f"Moving to previous scene {target_scene} at frame {self.current_frame_idx}")
+        self.load_frame(self.current_frame_idx)
+    
+    def next_scene(self, event):
+        """Move to the next scene"""
+        if not self.scenes:
+            print("No scenes defined yet")
+            return
+            
+        current_scene = self.get_scene_for_frame(self.current_frame_idx)
+        if current_scene is None or current_scene >= len(self.scenes) - 1:
+            print("Already at the last scene")
+            return
+            
+        target_scene = current_scene + 1
+        self.current_scene = target_scene
+        self.current_frame_idx = self.scenes[target_scene]
+        print(f"Moving to next scene {target_scene} at frame {self.current_frame_idx}")
+        self.load_frame(self.current_frame_idx)
+    
     def clear_points(self, event):
         """Clear all points and reset"""
         self.points = []
         self.labels = []
-        self.initial_points = None
-        self.initial_labels = None
-        self.reference_mask = None
         self.load_frame(self.current_frame_idx)
     
     def load_frame(self, frame_idx):
@@ -334,9 +680,28 @@ class InteractiveSegmenter:
         
         self.ax.imshow(self.img)
         
-        # Update title with current mode information
+        # Determine which scene we're in
+        scene_id = self.get_scene_for_frame(frame_idx)
+        scene_range = self.get_scene_range(scene_id)
+        
+        # Update title with current mode and scene information
         mode_text = "POSITIVE" if self.point_mode == 1 else "NEGATIVE"
-        self.ax.set_title(f"Frame {frame_idx} - {mode_text} click mode")
+        scene_text = f"Scene {scene_id}" if scene_id is not None else "No Scene"
+        
+        # Only add range info if we have valid range
+        if scene_range[0] is not None and scene_range[1] is not None:
+            scene_text += f" (Frames {scene_range[0]}-{scene_range[1]-1})"
+        
+        self.ax.set_title(f"Frame {frame_idx} - {mode_text} click mode - {scene_text}")
+        
+        # If this frame is in a scene and has annotations, load them
+        self.points = []
+        self.labels = []
+        
+        if scene_id is not None and scene_id in self.scene_annotations:
+            scene_annot = self.scene_annotations[scene_id]
+            if str(frame_idx) in scene_annot:
+                self.points, self.labels = scene_annot[str(frame_idx)]
         
         # Show existing points if any
         if self.points and self.labels:
@@ -354,15 +719,25 @@ class InteractiveSegmenter:
         if event.inaxes != self.ax:
             return
         
+        # Get the current scene
+        scene_id = self.get_scene_for_frame(self.current_frame_idx)
+        
+        # Only allow annotations if we're in a defined scene
+        if scene_id is None:
+            print("Cannot add points: current frame is not part of any scene")
+            return
+        
         # Add point to the list
         x, y = event.xdata, event.ydata
         self.points.append([x, y])
         self.labels.append(self.point_mode)
         
-        # Store initial points for reapplication
-        if self.initial_points is None:
-            self.initial_points = self.points.copy()
-            self.initial_labels = self.labels.copy()
+        # Store points in scene annotations
+        if scene_id not in self.scene_annotations:
+            self.scene_annotations[scene_id] = {}
+            
+        self.scene_annotations[scene_id][str(self.current_frame_idx)] = (self.points.copy(), self.labels.copy())
+        self.save_scene_data()
         
         # Process points
         self.process_points()
@@ -373,24 +748,30 @@ class InteractiveSegmenter:
     def toggle_point_mode(self, event):
         self.point_mode = 1 - self.point_mode  # Toggle between 1 and 0
         mode_text = "POSITIVE" if self.point_mode == 1 else "NEGATIVE"
-        self.ax.set_title(f"Frame {self.current_frame_idx} - {mode_text} click mode")
+        scene_id = self.get_scene_for_frame(self.current_frame_idx)
+        scene_text = f"Scene {scene_id}" if scene_id is not None else "No Scene"
+        self.ax.set_title(f"Frame {self.current_frame_idx} - {mode_text} click mode - {scene_text}")
         plt.draw()
     
     def next_frame(self, event):
         if self.current_frame_idx < len(self.frame_names) - 1:
             self.current_frame_idx += 1
-            # Don't clear points when changing frames
             self.load_frame(self.current_frame_idx)
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     def prev_frame(self, event):
         if self.current_frame_idx > 0:
             self.current_frame_idx -= 1
-            # Keep points when changing frames
             self.load_frame(self.current_frame_idx)
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     def process_points(self):
+        """Process points for the current frame"""
+        scene_id = self.get_scene_for_frame(self.current_frame_idx)
+        if scene_id is None:
+            print("Cannot process points: current frame is not part of any scene")
+            return
+            
         if not self.points:
             return
         
@@ -412,45 +793,130 @@ class InteractiveSegmenter:
         if self.current_frame_idx not in self.video_segments:
             self.video_segments[self.current_frame_idx] = {}
         
-        # Store the reference mask for the first frame
+        # Store the mask
         mask = (out_mask_logits[0] > 0.0).cpu().numpy()
         self.video_segments[self.current_frame_idx][self.current_obj_id] = mask
-        
-        if self.reference_mask is None and self.initial_points is not None:
-            self.reference_mask = mask.copy()
         
         # Clean up GPU memory
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         gc.collect()
     
-    def process_video(self, event):
-        print("Processing the entire video. This may take a while...")
-        
-        # Check if we have any points to work with
-        if not self.points or not self.labels:
-            print("\nERROR: No segmentation points added yet. Please click on objects in the image before processing.")
-            print("Click on objects you want to segment (positive points), then click 'Process Video'.")
+    def process_current_scene(self, event):
+        """Process only the current scene"""
+        scene_id = self.get_scene_for_frame(self.current_frame_idx)
+        if scene_id is None:
+            print("Cannot process: current frame is not part of any scene")
             return
+            
+        print(f"Processing scene {scene_id}...")
         
-        # Store initial points and labels for keyframe re-application
-        if self.initial_points is None:
-            self.initial_points = self.points.copy()
-            self.initial_labels = self.labels.copy()
+        # Get scene range
+        start_idx, end_idx = self.get_scene_range(scene_id)
+        if start_idx is None or end_idx is None:
+            print("Cannot determine scene boundaries")
+            return
+            
+        # Check if we have any annotations for this scene
+        if scene_id not in self.scene_annotations or not self.scene_annotations[scene_id]:
+            print("No annotations found for this scene")
+            return
+            
+        try:
+            # Process this scene
+            self._process_scene(scene_id, start_idx, end_idx)
+            
+            # Verify outputs
+            output_files = os.listdir(self.mask_dir) + os.listdir(self.overlay_dir)
+            if not output_files:
+                print("\nWARNING: No output files were generated. Something went wrong during processing.")
+            else:
+                print(f"Scene {scene_id} processing complete! Results saved to {self.output_dir}")
+                
+        except Exception as e:
+            print(f"Error processing scene {scene_id}: {e}")
+            traceback.print_exc()
+        finally:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+    
+    def process_video(self, event):
+        """Process all scenes in the video with improved device management"""
+        if not self.scenes:
+            print("No scenes defined. Please define scenes first.")
+            return
+            
+        print("Processing all scenes in the video. This may take a while...")
         
         try:
             total_frames = len(self.frame_names)
             print(f"Total frames to process: {total_frames}")
+            print(f"Total scenes to process: {len(self.scenes)}")
             
-            # Use improved keyframe-based processing
-            self._process_video_with_keyframes()
+            # Process each scene separately
+            for scene_id in range(len(self.scenes)):
+                start_idx, end_idx = self.get_scene_range(scene_id)
+                
+                if scene_id not in self.scene_annotations or not self.scene_annotations[scene_id]:
+                    print(f"Skipping scene {scene_id}: No annotations found")
+                    continue
+                    
+                print(f"Processing scene {scene_id} (frames {start_idx}-{end_idx-1})...")
+                
+                try:
+                    # Try processing with current device first
+                    self._process_scene(scene_id, start_idx, end_idx)
+                except RuntimeError as e:
+                    # If it's a memory error, retry with a new CPU predictor
+                    if "out of memory" in str(e) and self.enable_auto_fallback:
+                        print(f"\nMemory error in scene {scene_id}: {e}")
+                        print(f"Creating new CPU predictor for scene {scene_id}...")
+                        
+                        try:
+                            # Create a new predictor on CPU
+                            cpu_predictor = build_sam2_video_predictor_hf(
+                                self.model_id,
+                                device="cpu"
+                            )
+                            
+                            # Add the to() method to the new predictor
+                            from types import MethodType
+                            cpu_predictor.to = MethodType(_predictor_to, cpu_predictor)
+                            
+                            # Save original predictor
+                            original_predictor = self.predictor
+                            
+                            # Replace with CPU predictor
+                            self.predictor = cpu_predictor
+                            
+                            # Initialize new state
+                            self.inference_state = self.predictor.init_state(video_path=self.video_dir)
+                            
+                            # Re-process the scene on CPU
+                            self._process_scene(scene_id, start_idx, end_idx)
+                            
+                            # Restore original predictor 
+                            self.predictor = original_predictor
+                            self.inference_state = self.predictor.init_state(video_path=self.video_dir)
+                            
+                            # Clean up CPU predictor
+                            del cpu_predictor
+                            gc.collect()
+                            
+                        except Exception as cpu_e:
+                            print(f"Error processing on CPU as well: {cpu_e}")
+                            traceback.print_exc()
+                    else:
+                        # Not a memory error or fallback disabled
+                        print(f"Error processing scene {scene_id}: {e}")
+                        traceback.print_exc()
+                
+                # Clean up memory between scenes
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             
-            # Verify outputs exist
-            output_files = os.listdir(self.mask_dir) + os.listdir(self.overlay_dir)
-            if not output_files:
-                print("\nWARNING: No output files were generated. Something went wrong during processing.")
-                print("Please try again with different points or check the error messages above.")
-            else:
-                print(f"Processing complete! {len(output_files)} files saved to {self.output_dir}")
+            print(f"All scenes processed! Results saved to {self.output_dir}")
             
         except Exception as e:
             print(f"Error during video processing: {e}")
@@ -461,106 +927,222 @@ class InteractiveSegmenter:
                 torch.cuda.empty_cache()
             gc.collect()
     
-    def _process_video_with_keyframes(self):
-        """Process video using keyframes for better tracking"""
-        try:
-            total_frames = len(self.frame_names)
+    def _process_scene(self, scene_id, start_idx, end_idx):
+        """Process a single scene"""
+        if scene_id not in self.scene_annotations:
+            print(f"No annotations for scene {scene_id}")
+            return
             
-            # Convert initial points to numpy arrays
-            points_array = np.array(self.initial_points, dtype=np.float32)
-            labels_array = np.array(self.initial_labels, dtype=np.int32)
-            
-            # Reset the inference state to start fresh
-            print("Resetting model state for processing...")
-            self.predictor.reset_state(self.inference_state)
-            
-            # Set initial frame as keyframe
-            print(f"Setting initial keyframe at frame 0 with {len(points_array)} points")
-            keyframe_indices = [0]  # First frame is always a keyframe
-            
-            # Apply points to the first frame
-            with torch.no_grad():
-                _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
-                    inference_state=self.inference_state,
-                    frame_idx=0,
-                    obj_id=self.current_obj_id,
-                    points=points_array,
-                    labels=labels_array,
-                )
-            
-            # Save the first frame's result
-            current_frame_data = {
-                self.current_obj_id: (out_mask_logits[0] > 0.0).cpu().numpy()
-            }
-            self.save_single_frame_results(0, current_frame_data)
-            
-            # Process all frames
-            print("Processing frames...")
-            for frame_idx in range(1, total_frames):
-                # For keyframes, apply the original points
-                if frame_idx % self.keyframe_interval == 0:
-                    print(f"Setting keyframe at frame {frame_idx}")
-                    keyframe_indices.append(frame_idx)
-                    
-                    # Reset state for this keyframe
-                    self.predictor.reset_state(self.inference_state)
-                    
-                    # Apply points to this keyframe
-                    with torch.no_grad():
-                        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
-                            inference_state=self.inference_state,
-                            frame_idx=frame_idx,
-                            obj_id=self.current_obj_id,
-                            points=points_array,
-                            labels=labels_array,
-                        )
-                    
-                    # Save this keyframe result
-                    current_frame_data = {
-                        self.current_obj_id: (out_mask_logits[0] > 0.0).cpu().numpy()
-                    }
-                    self.save_single_frame_results(frame_idx, current_frame_data)
-                    
-                    # Process frames between this keyframe and the next
-                    start_idx = frame_idx
-                    end_idx = min(frame_idx + self.keyframe_interval, total_frames)
-                    
-                    print(f"Propagating from frame {start_idx} to {end_idx-1}")
-                    self._propagate_from_keyframe(start_idx, end_idx)
+        # Reset the inference state to start fresh for this scene
+        print(f"Initializing model state for scene {scene_id}...")
+        self.predictor.reset_state(self.inference_state)
+        
+        # Find the first annotated frame in this scene
+        first_annotated_frame = None
+        annotated_frames = []
+        for frame_str in self.scene_annotations[scene_id]:
+            frame_idx = int(frame_str)
+            if start_idx <= frame_idx < end_idx:
+                annotated_frames.append(frame_idx)
                 
-                # Clean up memory periodically
-                if frame_idx % 10 == 0:
-                    gc.collect()
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
+        if not annotated_frames:
+            print(f"No annotations found in scene {scene_id}")
+            return
             
-            print("Video processing complete!")
+        # Sort annotated frames
+        annotated_frames.sort()
+        first_annotated_frame = annotated_frames[0]
+        
+        print(f"Scene {scene_id} has {len(annotated_frames)} annotated frames")
+        print(f"First annotated frame: {first_annotated_frame}")
+        
+        # Apply points to the first annotated frame
+        points, labels = self.scene_annotations[scene_id][str(first_annotated_frame)]
+        points_array = np.array(points, dtype=np.float32)
+        labels_array = np.array(labels, dtype=np.int32)
+        
+        print(f"Setting initial annotation with {len(points)} points at frame {first_annotated_frame}")
+        
+        with torch.no_grad():
+            _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
+                inference_state=self.inference_state,
+                frame_idx=first_annotated_frame,
+                obj_id=self.current_obj_id,
+                points=points_array,
+                labels=labels_array,
+            )
+        
+        # Save the first annotated frame result
+        current_frame_data = {
+            self.current_obj_id: (out_mask_logits[0] > 0.0).cpu().numpy()
+        }
+        self.save_single_frame_results(first_annotated_frame, current_frame_data)
+        
+        # Process frames in chunks defined by annotated frames
+        for i in range(len(annotated_frames)):
+            current_frame = annotated_frames[i]
             
-        except Exception as e:
-            print(f"Error during keyframe-based processing: {e}")
-            traceback.print_exc()
-    
-    def _propagate_from_keyframe(self, start_idx, end_idx):
-        """Propagate from a keyframe to subsequent frames"""
-        try:
-            for _ in range(self.propagation_steps):  # Multiple propagation passes
+            # Define the end of this chunk (either the next annotated frame or scene end)
+            next_frame = end_idx
+            if i < len(annotated_frames) - 1:
+                next_frame = annotated_frames[i + 1]
+            
+            print(f"Processing chunk from frame {current_frame} to {next_frame-1}")
+            
+            # If we're not at the first frame, re-apply annotations
+            if i > 0:
+                points, labels = self.scene_annotations[scene_id][str(current_frame)]
+                points_array = np.array(points, dtype=np.float32)
+                labels_array = np.array(labels, dtype=np.int32)
+                
+                print(f"Applying {len(points)} points at frame {current_frame}")
+                
                 with torch.no_grad():
-                    for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(self.inference_state):
-                        if out_frame_idx > start_idx and out_frame_idx < end_idx:
-                            # Save masks for this frame
-                            current_frame_data = {
-                                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                                for i, out_obj_id in enumerate(out_obj_ids)
-                            }
-                            self.save_single_frame_results(out_frame_idx, current_frame_data)
-                            print(f"Processed frame {out_frame_idx}")
+                    _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
+                        inference_state=self.inference_state,
+                        frame_idx=current_frame,
+                        obj_id=self.current_obj_id,
+                        points=points_array,
+                        labels=labels_array,
+                    )
+                
+                # Save this annotated frame result
+                current_frame_data = {
+                    self.current_obj_id: (out_mask_logits[0] > 0.0).cpu().numpy()
+                }
+                self.save_single_frame_results(current_frame, current_frame_data)
+            
+            # Now propagate to the rest of the frames in this chunk
+            # Use keyframe-based propagation within the chunk
+            self._propagate_chunk(current_frame, next_frame)
+            
+            # Clean up memory between chunks
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    
+    # Replace the _propagate_chunk method with this corrected version
+    def _propagate_chunk(self, start_idx, end_idx):
+        """Propagate within a chunk using keyframes with automatic fallback to CPU on memory errors"""
+        # Calculate keyframes within this chunk
+        if start_idx >= end_idx - 1:
+            return  # Nothing to propagate
+            
+        # Create keyframes at regular intervals
+        keyframes = list(range(start_idx, end_idx, self.keyframe_interval))
+        if keyframes[-1] != end_idx - 1:
+            keyframes.append(end_idx - 1)
+            
+        print(f"Propagating with {len(keyframes)} keyframes in chunk")
+        
+        for i in range(len(keyframes) - 1):
+            kf_start = keyframes[i]
+            kf_end = keyframes[i + 1] + 1  # +1 because ranges are exclusive at the end
+            
+            print(f"Processing keyframe segment {kf_start} to {kf_end-1}")
+            
+            # Try with current device first (MPS/CUDA)
+            try:
+                # For each keyframe, do multiple propagation passes
+                for pass_idx in range(self.propagation_steps):
+                    with torch.no_grad():
+                        for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(self.inference_state):
+                            if kf_start <= out_frame_idx < kf_end:
+                                # Save masks for this frame
+                                current_frame_data = {
+                                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                                    for i, out_obj_id in enumerate(out_obj_ids)
+                                }
+                                self.save_single_frame_results(out_frame_idx, current_frame_data)
+                                
+                                if out_frame_idx % 10 == 0:
+                                    print(f"Processed frame {out_frame_idx} (pass {pass_idx+1}/{self.propagation_steps})")
+                            
+                            # Stop after kf_end frames
+                            if out_frame_idx >= kf_end - 1:
+                                break
+            
+            except RuntimeError as e:
+                # Check if it's a memory error
+                if "out of memory" in str(e) and self.enable_auto_fallback:
+                    print(f"\nMemory error detected: {e}")
+                    print("Creating a new predictor instance on CPU for this segment...")
+                    
+                    try:
+                        # Create a new predictor on CPU instead of trying to convert existing one
+                        cpu_predictor = build_sam2_video_predictor_hf(
+                            self.model_id,
+                            device="cpu"
+                        )
                         
-                        # Stop after end_idx frames
-                        if out_frame_idx >= end_idx - 1:
-                            break
-        except Exception as e:
-            print(f"Error during propagation: {e}")
-            traceback.print_exc()
+                        # Initialize new state with the video
+                        print("Initializing new CPU predictor state...")
+                        cpu_state = cpu_predictor.init_state(video_path=self.video_dir)
+                        
+                        # Find the latest processed frame data
+                        latest_frame = max([f for f in range(start_idx, kf_start + 1) if f in self.video_segments], default=None)
+                        if latest_frame is not None and self.current_obj_id in self.video_segments[latest_frame]:
+                            # If we have a previous mask, try to use it as a guide
+                            print(f"Using mask from frame {latest_frame} to guide CPU processing")
+                            mask = self.video_segments[latest_frame][self.current_obj_id]
+                            
+                            # Get annotation points for the closest annotated frame
+                            scene_id = self.get_scene_for_frame(kf_start)
+                            if scene_id is not None and scene_id in self.scene_annotations:
+                                frame_annotations = []
+                                for frame_str, (points, labels) in self.scene_annotations[scene_id].items():
+                                    frame_idx = int(frame_str)
+                                    if frame_idx <= kf_start:
+                                        frame_annotations.append((frame_idx, points, labels))
+                                
+                                if frame_annotations:
+                                    # Get closest annotated frame
+                                    closest_frame, closest_points, closest_labels = max(frame_annotations, key=lambda x: x[0])
+                                    
+                                    if closest_points and closest_labels:
+                                        print(f"Using points from frame {closest_frame} to guide CPU processing")
+                                        points_array = np.array(closest_points, dtype=np.float32)
+                                        labels_array = np.array(closest_labels, dtype=np.int32)
+                                        
+                                        # Add points to CPU predictor
+                                        cpu_predictor.add_new_points_or_box(
+                                            inference_state=cpu_state,
+                                            frame_idx=kf_start,
+                                            obj_id=self.current_obj_id,
+                                            points=points_array,
+                                            labels=labels_array,
+                                        )
+                        
+                        # Process on CPU with new predictor
+                        for pass_idx in range(self.propagation_steps):
+                            with torch.no_grad():
+                                for out_frame_idx, out_obj_ids, out_mask_logits in cpu_predictor.propagate_in_video(cpu_state):
+                                    if kf_start <= out_frame_idx < kf_end:
+                                        # Save masks for this frame
+                                        current_frame_data = {
+                                            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                                            for i, out_obj_id in enumerate(out_obj_ids)
+                                        }
+                                        self.save_single_frame_results(out_frame_idx, current_frame_data)
+                                        
+                                        if out_frame_idx % 5 == 0:  # More frequent updates on CPU
+                                            print(f"Processed frame {out_frame_idx} on CPU (pass {pass_idx+1}/{self.propagation_steps})")
+                                    
+                                    # Stop after kf_end frames
+                                    if out_frame_idx >= kf_end - 1:
+                                        break
+                        
+                        # Clean up CPU predictor to free memory
+                        del cpu_predictor
+                        del cpu_state
+                        gc.collect()
+                        
+                    except Exception as cpu_error:
+                        print(f"Error processing on CPU as well: {cpu_error}")
+                        traceback.print_exc()
+                else:
+                    # Not a memory error or fallback disabled
+                    raise
     
     def save_single_frame_results(self, frame_idx, frame_data):
         """Save segmentation masks and overlays for a single frame"""
@@ -599,6 +1181,12 @@ class InteractiveSegmenter:
                 # Add to overlay
                 show_mask(mask, ax, obj_id=obj_id)
             
+            # Add scene information to the overlay
+            scene_id = self.get_scene_for_frame(frame_idx)
+            if scene_id is not None:
+                ax.text(10, 30, f"Scene {scene_id}", fontsize=12, color='white', 
+                        bbox=dict(facecolor='black', alpha=0.5))
+            
             # Save overlay
             overlay_filename = f"frame_{frame_idx:04d}_overlay.png"
             overlay_path = os.path.join(self.overlay_dir, overlay_filename)
@@ -623,14 +1211,26 @@ if __name__ == "__main__":
     # Default model selection
     model_id = "facebook/sam2.1-hiera-large"
     
+    # Enable automatic CPU fallback by default
+    enable_auto_fallback = True
+    
     # Ask about MPS watermark ratio if on MPS device
     if device.type == "mps":
         print("\nYou're using an MPS device (Apple Silicon).")
         watermark_choice = input("Would you like to disable the MPS watermark ratio limit? This may help with memory errors. (y/n, default: y): ").lower().strip()
         if watermark_choice != "n":
             print("Disabling MPS watermark ratio limit.")
+            # Remove the environment variable completely instead of setting it to 0.8
             os.environ.pop("PYTORCH_MPS_HIGH_WATERMARK_RATIO", None)
             print("PyTorch MPS will now allocate memory as needed.")
+        
+        # Ask about automatic memory management option
+        auto_fallback = input("\nEnable automatic CPU fallback on memory errors? (y/n, default: y): ").lower().strip()
+        if auto_fallback == "n":
+            enable_auto_fallback = False
+            print("Automatic CPU fallback disabled. The script may crash if it runs out of memory.")
+        else:
+            print("Automatic CPU fallback enabled. The script will switch to CPU if memory runs out.")
     
     # Check available memory and suggest model options
     try:
@@ -696,18 +1296,30 @@ if __name__ == "__main__":
         print("Invalid value, using default of 3")
     
     # Start the interactive segmenter
-    print("\n=== HOW TO USE THIS IMPROVED TOOL ===")
-    print("1. When the image appears, CLICK ON THE OBJECT you want to segment")
-    print("2. By default, your clicks will add positive points (green markers)")
-    print("3. Use the 'Pos/Neg Mode' button to toggle to negative mode (red markers) to exclude areas")
-    print("4. Once you've added at least one point, click 'Process Video' to generate masks for all frames")
-    print("5. Use 'Clear Points' if you want to start over")
-    print("6. Results will be saved to the 'segmentation_output' folder in your frames directory")
+    print("\n=== HOW TO USE THIS SCENE-AWARE SEGMENTATION TOOL ===")
+    print("SCENE MANAGEMENT:")
+    print("1. First, use 'New Scene' to mark the start of each scene in your video")
+    print("2. Use 'Prev Scene' and 'Next Scene' to navigate between scenes")
+    print("3. Each scene is processed independently to handle different lighting/angles")
+    
+    print("\nANNOTATION:")
+    print("4. Within each scene, click on the pottery piece to add positive points (green)")
+    print("5. Use 'Pos/Neg Mode' to toggle to negative mode for excluding areas (red)")
+    print("6. You can annotate multiple frames within each scene for better tracking")
+    
+    print("\nPROCESSING:")
+    print("7. Use 'Process Current Scene' to process only the current scene")
+    print("8. Use 'Process Video' to process all scenes sequentially")
+    print("9. Results will be saved to the 'segmentation_output' folder")
+    
     print("\nIMPROVEMENTS:")
-    print(f"- Your annotations will be re-applied every {keyframe_interval} frames for better tracking")
-    print(f"- Each segment will be refined with {propagation_steps} propagation passes")
-    print("- Better memory management and object tracking")
-    print("\nIMPORTANT: You MUST click on the object you want to segment before processing the video!")
+    print(f"- Each scene is processed independently with its own tracking memory")
+    print(f"- Your annotations are re-applied every {keyframe_interval} frames for better tracking")
+    print(f"- Each segment uses {propagation_steps} refinement passes for improved quality")
+    print(f"- Scene boundaries are saved between sessions")
+    print(f"- Automatic CPU fallback when memory is low: {'Enabled' if enable_auto_fallback else 'Disabled'}")
+    
+    print("\nIMPORTANT: You MUST create at least one scene and add annotations before processing!")
     print("=========================\n")
     
     try:
@@ -718,7 +1330,8 @@ if __name__ == "__main__":
             preload_frames=False, 
             model_id=model_id,
             keyframe_interval=keyframe_interval,
-            propagation_steps=propagation_steps
+            propagation_steps=propagation_steps,
+            enable_auto_fallback=enable_auto_fallback
         )
     except Exception as e:
         print(f"Error initializing segmenter: {e}")
