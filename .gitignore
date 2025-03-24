@@ -24,7 +24,11 @@
 2_NeRFs/masks
 
 NeRF/vessel
-Nerf/colmap_output
+NeRF/colmap_output
+NeRF/db
+
+MeshAnythingV2
+
 
 STEP_2_NeRF/data
 STEP_3_VIZ/nerf_model_weights.pth
