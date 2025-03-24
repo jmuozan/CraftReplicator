@@ -7,7 +7,24 @@
 1_Segment_Anything/sam2.1_hiera_large.pt
 1_Segment_Anything/extracted_frames
 
+1_Segment_Anything/checkpoints
+1_Segment_Anything/copies
+1_Segment_Anything/db
+1_Segment_Anything/depth_anything_v2
+1_Segment_Anything/scene_images
+1_Segment_Anything/scene_reconstructions
+1_Segment_Anything/vessel
 
+1_Segment_Anything/celadon_vessel_depth.mp4
+1_Segment_Anything/celadon_vessel.mp4
+1_Segment_Anything/vessel.mp4
+
+2_NeRFs/db
+2_NeRFs/glomap
+2_NeRFs/masks
+
+NeRF/vessel
+Nerf/colmap_output
 
 STEP_2_NeRF/data
 STEP_3_VIZ/nerf_model_weights.pth
