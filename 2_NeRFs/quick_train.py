@@ -13,9 +13,11 @@ from dataset import get_rays
 from rendering import rendering
 from model import Voxels, Nerf
 from ml_helpers import training
+import sys
+
 
 # Configuration with minimal parameters for a quick test
-dataset_name = "porcelain"  # Dataset folder name
+dataset_name = "pottery"  # Dataset folder name
 hidden_dim = 64            # Reduced hidden dimension for faster training
 epochs = 1                 # Just 1 epoch for testing
 warmup_epochs = 0          # Skip warmup to save time

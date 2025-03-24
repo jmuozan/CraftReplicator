@@ -7,6 +7,144 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
 
+from colmap_utils import read_cameras_binary, read_images_binary, read_points3d_binary
+
+def get_camera_poses(image_dir, colmap_dir):
+    """
+    Get camera poses either from COLMAP or initialize them if COLMAP failed
+    
+    Args:
+        image_dir: Directory containing input images
+        colmap_dir: Directory with COLMAP output
+        
+    Returns:
+        dict with camera poses, intrinsics, and image paths
+    """
+    # Check if COLMAP results exist
+    if os.path.exists(os.path.join(colmap_dir, "sparse/0")):
+        try:
+            return get_poses_from_colmap(colmap_dir)
+        except Exception as e:
+            print(f"Error parsing COLMAP output: {e}")
+            print("Falling back to initialized poses")
+    
+    # Initialize poses in a circle if COLMAP failed
+    return initialize_poses(image_dir)
+
+def get_poses_from_colmap(colmap_dir):
+    """Parse COLMAP output to get camera poses"""
+    cameras = read_cameras_binary(os.path.join(colmap_dir, "sparse/0/cameras.bin"))
+    images = read_images_binary(os.path.join(colmap_dir, "sparse/0/images.bin"))
+    
+    poses = []
+    intrinsics = []
+    img_paths = []
+    
+    for img_id in images:
+        img = images[img_id]
+        cam = cameras[img.camera_id]
+        
+        # Convert quaternion to rotation matrix
+        R = qvec2rotmat(img.qvec)
+        t = img.tvec
+        
+        # Create camera-to-world matrix
+        w2c = np.zeros((4, 4), dtype=np.float32)
+        w2c[:3, :3] = R
+        w2c[:3, 3] = t
+        w2c[3, 3] = 1
+        
+        c2w = np.linalg.inv(w2c)
+        
+        # Convert to NeRF convention
+        c2w[:3, 1:3] *= -1  # Invert Y and Z
+        
+        poses.append(c2w)
+        img_paths.append(img.name)
+        
+        # Extract focal length and principal point
+        if cam.model == "SIMPLE_PINHOLE":
+            focal_length = cam.params[0]
+            cx, cy = cam.params[1], cam.params[2]
+        elif cam.model == "PINHOLE":
+            focal_length = (cam.params[0] + cam.params[1]) / 2
+            cx, cy = cam.params[2], cam.params[3]
+        else:
+            focal_length = cam.params[0]
+            cx, cy = cam.width / 2, cam.height / 2
+            
+        intrinsics.append([focal_length, focal_length, cx, cy])
+    
+    return {
+        'poses': np.array(poses),
+        'intrinsics': np.array(intrinsics),
+        'img_paths': img_paths
+    }
+
+def initialize_poses(image_dir):
+    """Initialize camera poses in a circle if COLMAP fails"""
+    # Get list of images
+    img_paths = [f for f in os.listdir(image_dir) if f.endswith(('.jpg', '.png', '.jpeg'))]
+    
+    # Get image dimensions from first image
+    img = imageio.imread(os.path.join(image_dir, img_paths[0]))
+    H, W = img.shape[:2]
+    
+    # Default focal length estimate
+    focal = max(H, W)
+    
+    # Create poses in a circle
+    poses = []
+    intrinsics = []
+    
+    num_images = len(img_paths)
+    for i in range(num_images):
+        # Place cameras in a circle around the origin
+        angle = 2 * np.pi * i / num_images
+        radius = 4.0  # Distance from center
+        
+        # Camera position
+        tx = radius * np.cos(angle)
+        ty = 0.0  # Height
+        tz = radius * np.sin(angle)
+        
+        # Camera viewing direction (looking at origin)
+        camera_dir = np.array([-tx, -ty, -tz])
+        camera_dir = camera_dir / np.linalg.norm(camera_dir)
+        
+        # Compute camera axes
+        up = np.array([0.0, 1.0, 0.0])  # World up vector
+        right = np.cross(camera_dir, up)
+        right = right / np.linalg.norm(right)
+        true_up = np.cross(right, camera_dir)
+        
+        # Create rotation matrix
+        R = np.stack([right, true_up, -camera_dir], axis=1)  # Column-major
+        
+        # Create camera-to-world matrix
+        c2w = np.zeros((4, 4), dtype=np.float32)
+        c2w[:3, :3] = R
+        c2w[:3, 3] = [tx, ty, tz]
+        c2w[3, 3] = 1.0
+        
+        poses.append(c2w)
+        intrinsics.append([focal, focal, W/2, H/2])
+    
+    return {
+        'poses': np.array(poses),
+        'intrinsics': np.array(intrinsics),
+        'img_paths': img_paths
+    }
+
+def qvec2rotmat(qvec):
+    """Convert quaternion to rotation matrix"""
+    return np.array([
+        [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2, 2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3], 2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2]],
+        [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3], 1 - 2 * qvec[1]**2 - 2 * qvec[3]**2, 2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1]],
+        [2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2], 2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1], 1 - 2 * qvec[1]**2 - 2 * qvec[2]**2]
+    ])
+
+
 def get_rays_from_transforms(datapath, mode='train'):
     """
     Load camera rays from a transforms.json file generated by colmap2nerf.py or run_glomap.py

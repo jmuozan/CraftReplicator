@@ -1,0 +1,14 @@
+COLMAP run started at: 2025-03-21 14:50:19.740492
+Running command: colmap feature_extractor --image_path db --database_path /Users/jorgemuyo/Desktop/CraftReplicator/2_NeRFs/distorted/database.db --ImageReader.single_camera 1 --ImageReader.camera_model PINHOLE --SiftExtraction.use_gpu 1
+Time taken for command: 3.42 seconds
+Running command: colmap exhaustive_matcher --database_path /Users/jorgemuyo/Desktop/CraftReplicator/2_NeRFs/distorted/database.db
+Time taken for command: 4.85 seconds
+Running command: glomap mapper --database_path /Users/jorgemuyo/Desktop/CraftReplicator/2_NeRFs/distorted/database.db --image_path db --output_path /Users/jorgemuyo/Desktop/CraftReplicator/2_NeRFs/distorted/sparse --TrackEstablishment.max_num_tracks 5000
+Time taken for command: 36.37 seconds
+Running command: colmap image_undistorter --image_path db --input_path /Users/jorgemuyo/Desktop/CraftReplicator/2_NeRFs/distorted/sparse/0 --output_path /Users/jorgemuyo/Desktop/CraftReplicator/2_NeRFs --output_type COLMAP
+Time taken for undistortion: 0.04 seconds
+Moved cameras.bin to /Users/jorgemuyo/Desktop/CraftReplicator/2_NeRFs/sparse/0
+Moved images.bin to /Users/jorgemuyo/Desktop/CraftReplicator/2_NeRFs/sparse/0
+Moved points3D.bin to /Users/jorgemuyo/Desktop/CraftReplicator/2_NeRFs/sparse/0
+COLMAP run finished at: 2025-03-21 14:51:04.416715
+Total time taken: 44.68 seconds
