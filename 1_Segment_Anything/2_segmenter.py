@@ -1,5 +1,7 @@
 import os
 import numpy as np
+import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 import torch
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -16,6 +18,8 @@ import time  # For timing operations
 import json  # For saving/loading scene data
 from types import MethodType
 
+
+
 # Device selection
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -24,7 +28,10 @@ elif torch.backends.mps.is_available():
     # We'll handle MPS memory settings later based on user input
 else:
     device = torch.device("cpu")
+
+device = torch.device("mps")
 print(f"Using device: {device}")
+
 
 # Memory optimization settings
 torch.set_grad_enabled(False)  # Disable gradient tracking completely

@@ -11,8 +11,8 @@ def extract_objects_with_masks():
     print(f"Created output directory: {output_dir}")
 
     # Paths
-    frames_dir = "vessel"
-    masks_dir = "vessel/segmentation_output/masks"
+    frames_dir = "pottery"
+    masks_dir = "pottery/segmentation_output/masks"
 
     # Get all mask files
     mask_files = sorted([f for f in os.listdir(masks_dir) if f.endswith(".png")])
